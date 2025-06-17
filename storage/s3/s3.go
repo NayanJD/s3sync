@@ -145,7 +145,7 @@ func (st *S3Storage) List(output chan<- *storage.Object) error {
 func (st *S3Storage) PutObject(obj *storage.Object) error {
 	const (
 		maxPutObjectSize = 5 * 1024 * 1024 * 1024 // 5 GiB
-		partSize        = 100 * 1024 * 1024       // 100 MiB per part
+		partSize         = 5 * 1024 * 1024 * 1024 // 100 MiB per part
 	)
 
 	// Get object size
@@ -218,7 +218,7 @@ func (st *S3Storage) PutObject(obj *storage.Object) error {
 
 	for offset := int64(0); offset < size; offset += partSize {
 		partSize := min(partSize, size-offset)
-    
+
 		// Upload part
 		uploadInput := &s3.UploadPartInput{
 			Body:          io.NewSectionReader(reader, offset, partSize),
