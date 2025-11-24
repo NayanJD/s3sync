@@ -140,9 +140,150 @@ func (st *S3Storage) List(output chan<- *storage.Object) error {
 
 }
 
-// PutObject saves object to S3.
-// PutObject ignore VersionId, it always save object as latest version.
+// PutObject uploads an object to S3 using either PutObject or MultipartUpload
+// based on the object size. Objects larger than 5GiB are automatically handled via MultipartUpload.
 func (st *S3Storage) PutObject(obj *storage.Object) error {
+	const (
+		maxPutObjectSize = 5 * 1024 * 1024 * 1024 // 5 GiB
+		partSize         = 5 * 1024 * 1024 * 1024 // 100 MiB per part
+	)
+
+	// Get object size
+	var size int64
+	if obj.Content != nil {
+		size = int64(len(*obj.Content))
+	} else if obj.ContentLength != nil {
+		size = *obj.ContentLength
+	} else {
+		return errors.New("unable to determine object size")
+	}
+
+	// Use regular PutObject for files <= 5GiB
+	if size <= maxPutObjectSize {
+		return st.putObject(obj)
+	}
+
+	// For larger files, use multipart upload
+	input := &s3.CreateMultipartUploadInput{
+		Bucket:               st.awsBucket,
+		Key:                  aws.String(st.prefix + *obj.Key),
+		ContentType:          obj.ContentType,
+		ContentDisposition:   obj.ContentDisposition,
+		ContentEncoding:      obj.ContentEncoding,
+		ContentLanguage:      obj.ContentLanguage,
+		ACL:                  obj.ACL,
+		Metadata:             obj.Metadata,
+		CacheControl:         obj.CacheControl,
+		StorageClass:         obj.StorageClass,
+		ServerSideEncryption: obj.ServerSideEncryption,
+	}
+
+	// Create the multipart upload
+	resp, err := st.awsSvc.CreateMultipartUploadWithContext(st.ctx, input)
+	if err != nil {
+		return err
+	}
+
+	// Prepare the data source
+	var data []byte
+	if obj.Content != nil {
+		data = *obj.Content
+	} else if obj.ContentStream != nil {
+		// Buffer the stream content since we need a ReadSeeker
+		buf := bytes.NewBuffer(make([]byte, 0, size))
+		if _, err := io.Copy(ratelimit.NewWriter(buf, st.rlBucket), obj.ContentStream); err != nil {
+			return err
+		}
+		obj.ContentStream.Close()
+		data = buf.Bytes()
+	} else {
+		return errors.New("object has no content")
+	}
+
+	// Create a reader that implements both ReadSeeker and ReaderAt
+	baseReader := bytes.NewReader(data)
+	// We use the base reader for ReadAt operations (needed for multipart upload)
+	// and wrap it with rate limiting for normal reads
+	reader := &struct {
+		io.ReadSeeker
+		io.ReaderAt
+	}{
+		ReadSeeker: ratelimit.NewReadSeeker(baseReader, st.rlBucket),
+		ReaderAt:   baseReader,
+	}
+
+	// Upload parts
+	var completedParts []*s3.CompletedPart
+	partNumber := int64(1)
+
+	for offset := int64(0); offset < size; offset += partSize {
+		partSize := min(partSize, size-offset)
+
+		// Upload part
+		uploadInput := &s3.UploadPartInput{
+			Body:          io.NewSectionReader(reader, offset, partSize),
+			Bucket:        st.awsBucket,
+			Key:           aws.String(st.prefix + *obj.Key),
+			PartNumber:    aws.Int64(partNumber),
+			UploadId:      resp.UploadId,
+			ContentLength: aws.Int64(partSize),
+		}
+
+		uploadResult, err := st.awsSvc.UploadPartWithContext(st.ctx, uploadInput)
+		if err != nil {
+			// Abort multipart upload on error
+			_, abortErr := st.awsSvc.AbortMultipartUploadWithContext(st.ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   st.awsBucket,
+				Key:      aws.String(st.prefix + *obj.Key),
+				UploadId: resp.UploadId,
+			})
+			if abortErr != nil {
+				storage.Log.Debugf("Failed to abort multipart upload: %v", abortErr)
+			}
+			return err
+		}
+
+		completedParts = append(completedParts, &s3.CompletedPart{
+			ETag:       uploadResult.ETag,
+			PartNumber: aws.Int64(partNumber),
+		})
+
+		partNumber++
+	}
+
+	// Complete multipart upload
+	completeInput := &s3.CompleteMultipartUploadInput{
+		Bucket:   st.awsBucket,
+		Key:      aws.String(st.prefix + *obj.Key),
+		UploadId: resp.UploadId,
+		MultipartUpload: &s3.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	}
+
+	if _, err := st.awsSvc.CompleteMultipartUploadWithContext(st.ctx, completeInput); err != nil {
+		return err
+	}
+
+	// Set ACL if specified
+	if obj.AccessControlPolicy != nil {
+		inputAcl := &s3.PutObjectAclInput{
+			Bucket:              st.awsBucket,
+			Key:                 aws.String(st.prefix + *obj.Key),
+			AccessControlPolicy: obj.AccessControlPolicy,
+		}
+
+		if _, err := st.awsSvc.PutObjectAclWithContext(st.ctx, inputAcl); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// putObject saves object to S3.
+// putObject ignore VersionId, it always save object as latest version.
+func (st *S3Storage) putObject(obj *storage.Object) error {
 	var objReader io.ReadSeeker
 	if obj.Content == nil {
 		if obj.ContentStream == nil {
@@ -292,4 +433,12 @@ func (st *S3Storage) DeleteObject(obj *storage.Object) error {
 		return err
 	}
 	return nil
+}
+
+// min returns the smaller of two int64 values
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
